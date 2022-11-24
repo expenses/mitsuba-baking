@@ -22,7 +22,7 @@ scene = mi.load_file(sys.argv[1])
 # Configuration
 NUM_CAMERAS = 100
 FACE_SIZE = 16
-center = mi.ScalarPoint3f(0, 1, 0)
+center = mi.ScalarPoint3f(0, 0, 0)
 scale = mi.ScalarPoint3f(2, 2, 2)
 
 image_res = [NUM_CAMERAS * FACE_SIZE * 6, NUM_CAMERAS * FACE_SIZE]
@@ -39,14 +39,9 @@ film = mi.load_dict(
         "component_format": "float32",
     }
 )
-film.prepare([])
 sampler = mi.load_dict({"type": "independent", "sample_count": 1})
 sampler.seed(0xDEADCAFE, image_res[0] * image_res[1])
-integrator = mi.load_dict(
-    {
-        "type": "path",
-    }
-)
+integrator = mi.load_dict({"type": "path"})
 
 lower_left = center - scale / 2
 increment = scale / NUM_CAMERAS
@@ -103,14 +98,14 @@ up = array_from_values(
 face_dir = dr.gather(dtype=type(face_dir), source=face_dir, index=camera_face)
 up = dr.gather(dtype=type(up), source=up, index=camera_face)
 
-m_camera_to_sample = mi.perspective_projection(
+camera_to_sample = mi.perspective_projection(
     [FACE_SIZE, FACE_SIZE], [FACE_SIZE, FACE_SIZE], [0, 0], 90, 0.0001, 1000
 )
 
-m_sample_to_camera = m_camera_to_sample.inverse()
+sample_to_camera = camera_to_sample.inverse()
 
 ray_dir = mi.Transform4f.look_at([0, 0, 0], face_dir, up) @ dr.normalize(
-    m_sample_to_camera @ mi.Point3f(uv.x, uv.y, 0)
+    sample_to_camera @ mi.Point3f(uv.x, uv.y, 0)
 )
 
 for z in range(NUM_CAMERAS):
@@ -119,6 +114,9 @@ for z in range(NUM_CAMERAS):
         print(f"Skipping {filename}")
         continue
 
+    # Reset the film to stop samples for accumulating
+    film.prepare([])
+
     print(f"rendering {filename}")
     index_z = dr.full(mi.Float, z, len(index.x))
     coord = mi.Vector3f(index.x, index.y, index_z)
@@ -126,13 +124,13 @@ for z in range(NUM_CAMERAS):
 
     ray = mi.Ray3f(o=origin, d=ray_dir)
 
-    (spec, mask, aov) = integrator.sample(scene, sampler, ray, medium=None, active=True)
+    (spec, mask, aov) = integrator.sample(scene, sampler, ray)
     image_block = film.create_block()
     image_block.put((coord_f.x, coord_f.y), [spec.x, spec.y, spec.z, 1.0])
     # For debugging
-    # image_block.put((dest_x, dest_y), [origin.x, origin.y, origin.z, 1.0])
+    # image_block.put((coord_f.x, coord_f.y), [origin.x, origin.y, origin.z, 1.0])
     film.put_block(image_block)
 
     image = film.develop()
 
-    mi.util.write_bitmap(f"output/{z}.exr", image, write_async=True)
+    mi.util.write_bitmap(filename, image)
