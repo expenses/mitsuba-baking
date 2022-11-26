@@ -5,32 +5,23 @@ import drjit as dr
 
 # dr.set_log_level(dr.LogLevel.Info)
 
-
-def array_from_values(values):
-    array = dr.zeros(type(values[0]), len(values))
-
-    for i, value in enumerate(values):
-        dr.scatter(array, value, i)
-
-    return array
-
-
 mi.set_variant("llvm_ad_rgb")
 
 scene = mi.load_file(sys.argv[1])
 
 # Configuration
-NUM_CAMERAS = 100
-FACE_SIZE = 16
+NUM_CAMERAS = 25
+NUM_SAMPLES = 1024
+NUM_VEC3_COEFFICIENTS = 9
 center = mi.ScalarPoint3f(0, 0, 0)
 scale = mi.ScalarPoint3f(2, 2, 2)
 
-image_res = [NUM_CAMERAS * FACE_SIZE * 6, NUM_CAMERAS * FACE_SIZE]
+image_res = [NUM_CAMERAS, NUM_CAMERAS]
 
 film = mi.load_dict(
     {
         "type": "hdrfilm",
-        "width": image_res[0],
+        "width": image_res[0] * NUM_VEC3_COEFFICIENTS,
         "height": image_res[1],
         "rfilter": {
             "type": "box",
@@ -40,7 +31,6 @@ film = mi.load_dict(
     }
 )
 sampler = mi.load_dict({"type": "independent", "sample_count": 1})
-sampler.seed(0xDEADCAFE, image_res[0] * image_res[1])
 integrator = mi.load_dict({"type": "path"})
 
 lower_left = center - scale / 2
@@ -55,82 +45,104 @@ coord = mi.Vector2u(
 )
 coord_f = dr.float_array_t(coord)(coord)
 
-# Get coordinates within the face
-fract = coord % FACE_SIZE
+z = int(sys.argv[2])
+sampler.seed(z, dr.prod(image_res))
 
-# get coordinates outside the face, of views
-index = coord // FACE_SIZE
+filename = f"output/{z}.exr"
+if os.path.exists(filename):
+    print(f"Skipping {filename}")
+    sys.exit(0)
 
-# Get which face is being rendered for each probe
-camera_face = index.x % 6
-# And which probe is being rendered on x
-index.x //= 6
+coord_z = dr.full(mi.Float, z, len(coord_f.x))
+coord = mi.Vector3f(coord_f.x, coord_f.y, coord_z)
+origin = lower_left + increment * (coord + 0.5)
 
-index = dr.float_array_t(index)(index)
+interaction = mi.Interaction3f(t=0, time=0, p=origin, wavelengths=mi.Color0f())
 
-# Generate a uv coord that goes directly through the center of each pixel
-uv = (dr.float_array_t(fract)(fract) + 0.5) / FACE_SIZE
-# Flip on x
-uv.x = 1.0 - uv.x
+i = mi.UInt32(0)
+sh_0 = mi.Vector3f(0, 0, 0)
+sh_1 = mi.Vector3f(0, 0, 0)
+sh_2 = mi.Vector3f(0, 0, 0)
+sh_3 = mi.Vector3f(0, 0, 0)
+sh_4 = mi.Vector3f(0, 0, 0)
+sh_5 = mi.Vector3f(0, 0, 0)
+sh_6 = mi.Vector3f(0, 0, 0)
+sh_7 = mi.Vector3f(0, 0, 0)
+sh_8 = mi.Vector3f(0, 0, 0)
 
-face_dir = array_from_values(
-    [
-        dr.llvm.Array3f(+1, 0, 0),  # +x
-        dr.llvm.Array3f(-1, 0, 0),  # -x
-        dr.llvm.Array3f(0, +1, 0),  # +y
-        dr.llvm.Array3f(0, -1, 0),  # -y
-        dr.llvm.Array3f(0, 0, +1),  # +z
-        dr.llvm.Array3f(0, 0, -1),  # -z
-    ]
+# Forsyth's weights
+weight1 = 0.25#4.0 / 17.0
+weight2 = 0.5#8.0 / 17.0
+weight3 = 0#5.0 / 68.0
+weight4 = 0#15.0 / 17.0
+weight5 = 0#15.0 / 68.0
+
+loop = mi.Loop(
+    name="",
+    state=lambda: (
+        i,
+        sh_0,
+        sh_1,
+        sh_2,
+        sh_3,
+        sh_4,
+        sh_5,
+        sh_6,
+        sh_7,
+        sh_8,
+        sampler,
+    ),
 )
 
-up = array_from_values(
-    [
-        dr.llvm.Array3f(0, 1, 0),
-        dr.llvm.Array3f(0, 1, 0),
-        dr.llvm.Array3f(0, 0, -1),
-        dr.llvm.Array3f(0, 0, +1),
-        dr.llvm.Array3f(0, 1, 0),
-        dr.llvm.Array3f(0, 1, 0),
-    ]
-)
+while loop(i < NUM_SAMPLES):
+    i += 1
+    (ds, spec) = scene.sample_emitter_direction(interaction, sampler.next_2d())
 
-face_dir = dr.gather(dtype=type(face_dir), source=face_dir, index=camera_face)
-up = dr.gather(dtype=type(up), source=up, index=camera_face)
+    # Check if we hit an emitter. If the pdf is 0 then we didn't and need to run the pathfinder
+    pathfinder_active = dr.eq(ds.pdf, 0.0)
 
-camera_to_sample = mi.perspective_projection(
-    [FACE_SIZE, FACE_SIZE], [FACE_SIZE, FACE_SIZE], [0, 0], 90, 0.0001, 1000
-)
+    # Optionally change the sample direction to a point on a uniform sphere
+    #ds.d = dr.select(pathfinder_active, mi.warp.square_to_uniform_sphere(sampler.next_2d()), ds.d)
 
-sample_to_camera = camera_to_sample.inverse()
+    (path_spec, mask, aov) = integrator.sample(
+        scene, sampler, interaction.spawn_ray(ds.d), active=pathfinder_active
+    )
 
-ray_dir = mi.Transform4f.look_at([0, 0, 0], face_dir, up) @ dr.normalize(
-    sample_to_camera @ mi.Point3f(uv.x, uv.y, 0)
-)
+    spec[pathfinder_active] += path_spec
 
-for z in range(NUM_CAMERAS):
-    filename = f"output/{z}.exr"
-    if os.path.exists(filename):
-        print(f"Skipping {filename}")
-        continue
+    sh_0 += spec
 
-    # Reset the film to stop samples for accumulating
-    film.prepare([])
+    sh_1 += spec * ds.d.y
+    sh_2 += spec * ds.d.z
+    sh_3 += spec * ds.d.x
 
-    print(f"rendering {filename}")
-    index_z = dr.full(mi.Float, z, len(index.x))
-    coord = mi.Vector3f(index.x, index.y, index_z)
-    origin = lower_left + increment * (coord + 0.5)
+    sh_4 += spec * ds.d.y * ds.d.x
+    sh_5 += spec * ds.d.y * ds.d.z
+    sh_6 += spec * (3.0 * ds.d.z * ds.d.z - 1.0)
+    sh_7 += spec * ds.d.z * ds.d.x
+    sh_8 += spec * (ds.d.x * ds.d.x - ds.d.y * ds.d.y)
 
-    ray = mi.Ray3f(o=origin, d=ray_dir)
+sh = [sh_0, sh_1, sh_2, sh_3, sh_4, sh_5, sh_6, sh_7, sh_8]
+weights = [
+    weight1,
+    weight2,
+    weight2,
+    weight2,
+    weight3,
+    weight3,
+    weight4,
+    weight3,
+    weight5,
+]
 
-    (spec, mask, aov) = integrator.sample(scene, sampler, ray)
-    image_block = film.create_block()
-    image_block.put((coord_f.x, coord_f.y), [spec.x, spec.y, spec.z, 1.0])
-    # For debugging
-    # image_block.put((coord_f.x, coord_f.y), [origin.x, origin.y, origin.z, 1.0])
-    film.put_block(image_block)
+sh = [sh * weight / NUM_SAMPLES for sh, weight in zip(sh, weights)]
 
-    image = film.develop()
+film.prepare([])
+image_block = film.create_block()
+for i, sh in enumerate(sh):
+    image_block.put((coord_f.x + i * NUM_CAMERAS, coord_f.y), [sh.x, sh.y, sh.z, 1.0])
+film.put_block(image_block)
 
-    mi.util.write_bitmap(filename, image)
+image = film.develop()
+
+mi.util.write_bitmap(filename, image)
