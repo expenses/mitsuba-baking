@@ -2,27 +2,42 @@ import os
 import sys
 import mitsuba as mi
 import drjit as dr
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--sample-count", type=int, default=1024)
+parser.add_argument("-n", "--probe-count", type=int, nargs=3, default=[100, 100, 100])
+parser.add_argument("scene_path")
+parser.add_argument("z_level", type=int)
+parser.add_argument("--scale", type=float, nargs=3, default=[100, 100, 100])
+parser.add_argument("--center", type=float, nargs=3, default=[0, 0, 0])
+
+args = parser.parse_args()
+print(args)
 
 # dr.set_log_level(dr.LogLevel.Info)
 
 mi.set_variant("llvm_ad_rgb")
 
-scene = mi.load_file(sys.argv[1])
+
+def add_value_to_spherical_harmonics(harmonics, value, normal, mask):
+    harmonics[0][mask] += value * 0.25
+    harmonics[1][mask] += value * 0.5 * normal.x
+    harmonics[2][mask] += value * 0.5 * normal.y
+    harmonics[3][mask] += value * 0.5 * normal.z
+
+
+scene = mi.load_file(args.scene_path)
 
 # Configuration
-NUM_CAMERAS = 25
-NUM_SAMPLES = 1024
 NUM_VEC3_COEFFICIENTS = 4
-center = mi.ScalarPoint3f(0, 0, 0)
-scale = mi.ScalarPoint3f(2, 2, 2)
-
-image_res = [NUM_CAMERAS, NUM_CAMERAS]
+probe_count = mi.ScalarPoint3u(args.probe_count)
 
 film = mi.load_dict(
     {
         "type": "hdrfilm",
-        "width": image_res[0] * NUM_VEC3_COEFFICIENTS,
-        "height": image_res[1],
+        "width": probe_count.x * NUM_VEC3_COEFFICIENTS,
+        "height": probe_count.y,
         "rfilter": {
             "type": "box",
         },
@@ -30,30 +45,30 @@ film = mi.load_dict(
         "component_format": "float32",
     }
 )
-sampler = mi.load_dict({"type": "independent", "sample_count": 1})
+sampler = mi.load_dict({"type": "independent", "sample_count": args.sample_count})
 integrator = mi.load_dict({"type": "path"})
 
-lower_left = center - scale / 2
-increment = scale / NUM_CAMERAS
+scale = mi.ScalarPoint3f(args.scale)
+lower_left = mi.ScalarPoint3f(args.center) - scale / 2
+increment = scale / probe_count
 
-# Create a meshgrid over all pixel coordinates
+# Create a meshgrid over the 2d slice of probes
 coord = mi.Vector2u(
     dr.meshgrid(
-        dr.arange(dr.llvm.UInt, image_res[0]),
-        dr.arange(dr.llvm.UInt, image_res[1]),
+        dr.arange(dr.llvm.UInt, probe_count.x),
+        dr.arange(dr.llvm.UInt, probe_count.y),
     )
 )
 coord_f = dr.float_array_t(coord)(coord)
 
-z = int(sys.argv[2])
-sampler.seed(z, dr.prod(image_res))
+sampler.seed(args.z_level, probe_count.x * probe_count.y)
 
-filename = f"output/{z}.exr"
+filename = f"output/{args.z_level}.exr"
 if os.path.exists(filename):
     print(f"Skipping {filename}")
     sys.exit(0)
 
-coord_z = dr.full(mi.Float, z, len(coord_f.x))
+coord_z = dr.full(mi.Float, args.z_level, len(coord_f.x))
 coord = mi.Vector3f(coord_f.x, coord_f.y, coord_z)
 origin = lower_left + increment * (coord + 0.5)
 
@@ -64,10 +79,6 @@ sh_0 = mi.Vector3f(0, 0, 0)
 sh_1 = mi.Vector3f(0, 0, 0)
 sh_2 = mi.Vector3f(0, 0, 0)
 sh_3 = mi.Vector3f(0, 0, 0)
-
-# Forsyth's weights
-weight1 = 0.25
-weight2 = 0.5
 
 loop = mi.Loop(
     name="",
@@ -81,42 +92,48 @@ loop = mi.Loop(
     ),
 )
 
-while loop(i < NUM_SAMPLES):
-    i += 1
+spherical_harmonics = [sh_0, sh_1, sh_2, sh_3]
+
+while loop(i < args.sample_count):
+    # Importance sample emitters
+
     (ds, spec) = scene.sample_emitter_direction(interaction, sampler.next_2d())
+    hit_emitter = dr.neq(ds.pdf, 0.0)
 
-    # Check if we hit an emitter. If the pdf is 0 then we didn't and need to run the pathfinder
-    pathfinder_active = dr.eq(ds.pdf, 0.0)
+    add_value_to_spherical_harmonics(spherical_harmonics, spec, ds.d, hit_emitter)
+    i[hit_emitter] += 1
 
-    # Potentially change the sample direction to a point on a uniform sphere
-    ds.d[pathfinder_active] = mi.warp.square_to_uniform_sphere(sampler.next_2d())
+    more_samples_needed = dr.neq(i, args.sample_count)
 
-    (path_spec, mask, aov) = integrator.sample(
-        scene, sampler, interaction.spawn_ray(ds.d), active=pathfinder_active
+    # Sample a random point in the scene
+
+    sample_dir = mi.warp.square_to_uniform_sphere(sampler.next_2d())
+
+    ray = interaction.spawn_ray(sample_dir)
+
+    # Run an initial intersection test
+    intersection_test = scene.ray_intersect(ray, mi.RayFlags(0), more_samples_needed)
+    intersection_emitter_pointers = mi.UInt.reinterpret_array_(
+        intersection_test.emitter(scene)
     )
 
-    spec[pathfinder_active] += path_spec
+    # If we didn't hit an emitter, run the pathtracer
+    pathtracer_active = dr.eq(intersection_emitter_pointers, 0) & more_samples_needed
 
-    sh_0 += spec
+    (spec, _, _) = integrator.sample(scene, sampler, ray, active=pathtracer_active)
 
-    sh_1 += spec * ds.d.y
-    sh_2 += spec * ds.d.z
-    sh_3 += spec * ds.d.x
+    add_value_to_spherical_harmonics(
+        spherical_harmonics, spec, sample_dir, pathtracer_active
+    )
+    i[pathtracer_active] += 1
 
-sh = [sh_0, sh_1, sh_2, sh_3]
-weights = [
-    weight1,
-    weight2,
-    weight2,
-    weight2,
-]
 
-sh = [sh * weight / NUM_SAMPLES for sh, weight in zip(sh, weights)]
+spherical_harmonics = [sh / args.sample_count for sh in spherical_harmonics]
 
 film.prepare([])
 image_block = film.create_block()
-for i, sh in enumerate(sh):
-    image_block.put((coord_f.x + i * NUM_CAMERAS, coord_f.y), [sh.x, sh.y, sh.z, 1.0])
+for i, sh in enumerate(spherical_harmonics):
+    image_block.put((coord_f.x + i * probe_count.x, coord_f.y), [sh.x, sh.y, sh.z, 1.0])
 film.put_block(image_block)
 
 image = film.develop()
