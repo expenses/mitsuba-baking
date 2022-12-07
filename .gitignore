@@ -2,3 +2,5 @@ env
 *.xml
 perf.data*
 *.exr
+*.blend
+*.blend1
