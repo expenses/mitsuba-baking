@@ -24,9 +24,12 @@ dr.set_log_level(dr.LogLevel.Info)
 
 mi.set_variant("llvm_ad_rgb")
 
+def fix_nan(value):
+    return dr.select(dr.isnan(value), 0, value)
 
 def generate_sphere_harmonics(value, normal):
-    return [value, value * normal.x, value * normal.y, value * normal.z]
+    values = [value, value * normal.x, value * normal.y, value * normal.z]
+    return [fix_nan(value) for value in values]
 
 
 scene = mi.load_file(args.scene_path)

@@ -1,6 +1,7 @@
 import sys
 import mitsuba as mi
 import drjit as dr
+import argparse
 
 def generate_sphere_harmonics(value, normal):
     return [value, value * normal.x, value * normal.y, value * normal.z]
@@ -24,38 +25,52 @@ def normalize_value(value, average):
     value = dr.select(dr.isnan(value), 0, value)
     return value# * 0.5 + 0.5
 
-scene = sys.argv[1]
-positions = sys.argv[2]
-normals = sys.argv[3]
+parser = argparse.ArgumentParser()
+parser.add_argument("scene_path")
+parser.add_argument("positions_path")
+parser.add_argument("normals_path")
+parser.add_argument("seed", type=int)
+parser.add_argument("--sample-count", type=int, default=1024)
+parser.add_argument("--supersampling", type=int, default=4)
+
+args = parser.parse_args()
+
+origin_sample_count = args.sample_count // (args.supersampling * args.supersampling)
+
+print(args, origin_sample_count)
 
 dr.set_log_level(dr.LogLevel.Info)
 mi.set_variant("llvm_ad_rgb")
 
-scene = mi.load_file(scene)
+scene = mi.load_file(args.scene_path)
 
-positions = mi.TensorXf(mi.Bitmap(positions))
-normals = mi.TensorXf(mi.Bitmap(normals))
+positions = mi.TensorXf(mi.Bitmap(args.positions_path))
+normals = mi.TensorXf(mi.Bitmap(args.normals_path))
+
+# Note: these are flipped for some reason.
+height = positions.shape[0]
+width = positions.shape[1]
+num_channels = positions.shape[2]
 
 integrator = mi.load_dict({"type": "path"})
 
-sample_count = 1024
-seed = 0x5EED
+sampler = mi.load_dict({"type": "independent", "sample_count": origin_sample_count})
 
-sampler = mi.load_dict({"type": "independent", "sample_count": sample_count})
-sampler.seed(seed, positions.shape[0] * positions.shape[1] * sample_count)
+sampler.seed(args.seed, width * height * origin_sample_count)
 
 index = dr.repeat(
-    dr.arange(dr.llvm.UInt, positions.shape[0] * positions.shape[1]), sample_count
+    dr.arange(dr.llvm.UInt, width * height), origin_sample_count
 )
 
-pixel_coord = mi.Vector3u(index * 4, index * 4 + 1, index * 4 + 2)
+pixel_offset = index * num_channels
+pixel_coord = mi.Vector3u(pixel_offset, pixel_offset + 1, pixel_offset + 2)
 
 position = dr.gather(mi.Vector3f, positions.array, pixel_coord)
 normal = dr.gather(mi.Vector3f, normals.array, pixel_coord)
 
 mask = dr.neq(normal.x, 0) | dr.neq(normal.y, 0) | dr.neq(normal.z, 0)
 
-coord = mi.Vector2u(index % positions.shape[0], index // positions.shape[0])
+coord = mi.Vector2u(index % width, index // width)
 coord = dr.float_array_t(coord)(coord)
 
 sample_dir = mi.warp.square_to_uniform_hemisphere(sampler.next_2d())
@@ -72,46 +87,17 @@ ray = interaction.spawn_ray(sample_dir)
 
 spherical_harmonics = generate_sphere_harmonics(spec, sample_dir)
 
-sh0_film, sh0_image_block = create_film(positions.shape[0], positions.shape[1])
-sh1x_film, sh1x_image_block = create_film(positions.shape[0], positions.shape[1])
-sh1y_film, sh1y_image_block = create_film(positions.shape[0], positions.shape[1])
-sh1z_film, sh1z_image_block = create_film(positions.shape[0], positions.shape[1])
+film, image_block = create_film(width * 4 // args.supersampling, height // args.supersampling)
 
+for i, sh in enumerate(spherical_harmonics):
+    image_block.put(
+        (coord + mi.ScalarVector2f(width * i, 0)) / args.supersampling,
+        [sh.x, sh.y, sh.z, 1.0],
+        active=mask,
+    )
 
-sh0_image_block.put(
-    coord,
-    [spherical_harmonics[0].x, spherical_harmonics[0].y, spherical_harmonics[0].z, 1.0],
-)
-sh0_film.put_block(sh0_image_block)
+film.put_block(image_block)
 
-sh1x_image_block.put(
-    coord,
-    [spherical_harmonics[1].x, spherical_harmonics[1].y, spherical_harmonics[1].z, 1.0],
-)
-sh1x_film.put_block(sh1x_image_block)
+image = film.develop()
 
-sh1y_image_block.put(
-    coord,
-    [spherical_harmonics[2].x, spherical_harmonics[2].y, spherical_harmonics[2].z, 1.0],
-)
-sh1y_film.put_block(sh1y_image_block)
-
-sh1z_image_block.put(
-    coord,
-    [spherical_harmonics[3].x, spherical_harmonics[3].y, spherical_harmonics[3].z, 1.0],
-)
-sh1z_film.put_block(sh1z_image_block)
-
-sh0 = sh0_film.develop()
-sh1x = sh1x_film.develop()
-sh1y = sh1y_film.develop()
-sh1z = sh1z_film.develop()
-
-sh1x = normalize_value(sh1x, sh0)
-sh1y = normalize_value(sh1y, sh0)
-sh1z = normalize_value(sh1z, sh0)
-
-mi.util.write_bitmap(f"{seed}_{sample_count}.exr", sh0)
-mi.util.write_bitmap("sh1x.exr", sh1x)
-mi.util.write_bitmap("sh1y.exr", sh1y)
-mi.util.write_bitmap("sh1z.exr", sh1z)
+mi.util.write_bitmap(f"{args.seed}_{args.sample_count}.exr", image)
