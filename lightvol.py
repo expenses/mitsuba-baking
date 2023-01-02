@@ -11,6 +11,8 @@ parser.add_argument("scene_path")
 parser.add_argument("z_level", type=int)
 parser.add_argument("--scale", type=float, nargs=3, default=[100, 100, 100])
 parser.add_argument("--center", type=float, nargs=3, default=[0, 0, 0])
+parser.add_argument("--direct-only", action="store_true")
+parser.add_argument("--indirect-only", action="store_true")
 
 args = parser.parse_args()
 print(args)
@@ -24,8 +26,10 @@ dr.set_log_level(dr.LogLevel.Info)
 
 mi.set_variant("llvm_ad_rgb")
 
+
 def fix_nan(value):
     return dr.select(dr.isnan(value), 0, value)
+
 
 def generate_sphere_harmonics(value, normal):
     values = [value, value * normal.x, value * normal.y, value * normal.z]
@@ -77,13 +81,35 @@ interaction = mi.Interaction3f(t=0, time=0, p=origin, wavelengths=mi.Color0f())
 film.prepare([])
 image_block = film.create_block()
 
-sample_dir = mi.warp.square_to_uniform_sphere(sampler.next_2d())
+spherical_harmonics = None
 
-ray = interaction.spawn_ray(sample_dir)
+if args.direct_only:
+    (ds, spec) = scene.sample_emitter_direction(interaction, sampler.next_2d())
+    spherical_harmonics = generate_sphere_harmonics(spec, ds.d)
+elif args.indirect_only:
+    sample_dir = mi.warp.square_to_uniform_sphere(sampler.next_2d())
 
-(spec, _, _) = integrator.sample(scene, sampler, ray)
+    ray = interaction.spawn_ray(sample_dir)
 
-spherical_harmonics = generate_sphere_harmonics(spec, sample_dir)
+    # Run an initial intersection test
+    # Todo: modify mitsuba so that `integrator.sample` returns whether or not an emitter was hit.
+    intersection_test = scene.ray_intersect(ray, mi.RayFlags(0), coherent=False)
+    intersection_emitter_pointers = mi.UInt.reinterpret_array_(
+        intersection_test.emitter(scene)
+    )
+    active = dr.eq(intersection_emitter_pointers, 0)
+
+    (spec, _, _) = integrator.sample(scene, sampler, ray, active=active)
+
+    spherical_harmonics = generate_sphere_harmonics(spec, sample_dir)
+else:
+    sample_dir = mi.warp.square_to_uniform_sphere(sampler.next_2d())
+
+    ray = interaction.spawn_ray(sample_dir)
+
+    (spec, _, _) = integrator.sample(scene, sampler, ray)
+
+    spherical_harmonics = generate_sphere_harmonics(spec, sample_dir)
 
 for i, sh in enumerate(spherical_harmonics):
     image_block.put(
