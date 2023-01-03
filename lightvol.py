@@ -17,7 +17,10 @@ parser.add_argument("--indirect-only", action="store_true")
 args = parser.parse_args()
 print(args)
 
-filename = f"output/{args.z_level}_{args.sample_count}.exr"
+if not os.path.exists("output"):
+    os.makedirs("output")
+
+filename = os.path.join("output", f"{args.z_level}_{args.sample_count}.exr")
 if os.path.exists(filename):
     print(f"Skipping {filename}")
     sys.exit(0)
@@ -47,15 +50,14 @@ film = mi.load_dict(
         "type": "hdrfilm",
         "width": probe_count.x * 4,
         "height": probe_count.y * probe_count.z,
-        "rfilter": {
-            "type": "box",
-        },
+        "rfilter": {"type": "box",},
         "pixel_format": "rgb",
         "component_format": "float32",
     }
 )
 sampler = mi.load_dict({"type": "independent", "sample_count": args.sample_count})
 integrator = mi.load_dict({"type": "path"})
+indirect_integrator = mi.load_dict({"type": "path", "hide_emitters": True})
 
 # Create a meshgrid over the 2d slice of probes
 coord = mi.Vector2u(
@@ -91,15 +93,10 @@ elif args.indirect_only:
 
     ray = interaction.spawn_ray(sample_dir)
 
-    # Run an initial intersection test
-    # Todo: modify mitsuba so that `integrator.sample` returns whether or not an emitter was hit.
-    intersection_test = scene.ray_intersect(ray, mi.RayFlags(0), coherent=False)
-    intersection_emitter_pointers = mi.UInt.reinterpret_array_(
-        intersection_test.emitter(scene)
-    )
-    active = dr.eq(intersection_emitter_pointers, 0)
-
-    (spec, _, _) = integrator.sample(scene, sampler, ray, active=active)
+    (spec, _, _) = indirect_integrator.sample(scene, sampler, ray)
+    # Limit the effect of fireflies
+    max_value = 10
+    spec = dr.minimum(spec, max_value)
 
     spherical_harmonics = generate_sphere_harmonics(spec, sample_dir)
 else:
