@@ -22,10 +22,14 @@ parser.add_argument("--sample-count", type=int, default=1024)
 parser.add_argument("--supersampling", type=int, default=4)
 parser.add_argument("--direct-only", action="store_true")
 parser.add_argument("--indirect-only", action="store_true")
+parser.add_argument("-o", "--output-dir", default="output_lightmap")
 
 args = parser.parse_args()
 
-filename = f"{args.seed}_{args.sample_count}.exr"
+if not os.path.exists(args.output_dir):
+    os.makedirs(args.output_dir)
+
+filename = filename = os.path.join(args.output_dir, f"{args.seed}_{args.sample_count}.exr")
 
 if os.path.exists(filename):
     print(f"{filename} exists, skipping")

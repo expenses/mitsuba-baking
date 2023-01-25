@@ -13,14 +13,15 @@ parser.add_argument("--scale", type=float, nargs=3, default=[100, 100, 100])
 parser.add_argument("--center", type=float, nargs=3, default=[0, 0, 0])
 parser.add_argument("--direct-only", action="store_true")
 parser.add_argument("--indirect-only", action="store_true")
+parser.add_argument("-o", "--output-dir", default="output")
 
 args = parser.parse_args()
 print(args)
 
-if not os.path.exists("output"):
-    os.makedirs("output")
+if not os.path.exists(args.output_dir):
+    os.makedirs(args.output_dir)
 
-filename = os.path.join("output", f"{args.z_level}_{args.sample_count}.exr")
+filename = os.path.join(args.output_dir, f"{args.z_level}_{args.sample_count}.exr")
 if os.path.exists(filename):
     print(f"Skipping {filename}")
     sys.exit(0)
